@@ -1,16 +1,14 @@
 # my_simple_agent.py
-from typing import Optional, Iterator
+from typing import Optional, Iterator, List, Dict, Any
 from core.agentBase import Agent
 from core.llmClient import HelloAgentsLLM
 from core.message import Message
 from core.config import Config
 import re
-from dotenv import load_dotenv
+from tools.registry import ToolRegistry, Tool
 from tools.websearch import WebSearch
-from tools.registry import ToolRegistry
-
-#
-load_dotenv()
+from tools.memory import Memory
+from tools.weather import Weather
 
 
 class MySimpleAgent(Agent):
@@ -25,13 +23,15 @@ class MySimpleAgent(Agent):
         llm: HelloAgentsLLM,
         system_prompt: Optional[str] = None,
         config: Optional[Config] = None,
-        tool_registry: Optional['ToolRegistry'] = None,
-        enable_tool_calling: bool = True
+        tool_registry: Optional["ToolRegistry"] = None,
+        enable_tool_calling: bool = True,
     ):
         super().__init__(name, llm, system_prompt, config)
         self.tool_registry = tool_registry
         self.enable_tool_calling = enable_tool_calling and tool_registry is not None
-        print(f"✅ {name} 初始化完成，工具调用: {'启用' if self.enable_tool_calling else '禁用'}")
+        print(
+            f"✅ {name} 初始化完成，工具调用: {'启用' if self.enable_tool_calling else '禁用'}"
+        )
 
     def run(self, input_text: str, max_tool_iterations: int = 3, **kwargs) -> str:
         """
@@ -81,15 +81,29 @@ class MySimpleAgent(Agent):
         tools_section += "你可以使用以下工具来帮助回答问题:\n"
         tools_section += tools_description + "\n"
 
-        tools_section += "\n## 工具调用格式\n"
-        tools_section += "当需要使用工具时，请使用以下格式:\n"
-        tools_section += "`[TOOL_CALL:{tool_name}:{parameters}]`\n"
-        tools_section += "例如:`[TOOL_CALL:WebSearch:Python编程]` 或 `[TOOL_CALL:memory:recall=用户信息]`\n\n"
-        tools_section += "工具调用结果会自动插入到对话中，然后你可以基于结果继续回答。\n"
+        # 添加 JSON Schema 格式的工具定义（供支持结构化工具调用的LLM使用）
+        tools_schema = self.tool_registry.get_all_tools_schema()
+        if tools_schema:
+            import json
+
+            tools_section += "\n## 工具Schema定义\n"
+            tools_section += "```json\n"
+            tools_section += json.dumps(tools_schema, ensure_ascii=False, indent=2)
+            tools_section += "\n```\n"
+
+        tools_section += "\n## 工具调用规则\n"
+        tools_section += "1. 当需要使用工具时，请一定使用以下格式:\n"
+        tools_section += "   `[TOOL_CALL:{tool_name}:{parameters}]`\n"
+        tools_section += "   例如: `[TOOL_CALL:WebSearch:nvidia最新的GPU]` 或 `[TOOL_CALL:memory:recall=用户信息]`\n"
+        tools_section += "2. 每个工具调用必须是独立的，不要在一个调用中嵌套另一个。\n"
+        tools_section += "3. 工具调用结果会自动插入到对话中，然后你可以基于结果继续回答。\n"
+        tools_section += "4. 如果不需要使用工具，直接给出回答即可。\n"
 
         return base_prompt + tools_section
 
-    def _run_with_tools(self, messages: list, input_text: str, max_tool_iterations: int, **kwargs) -> str:
+    def _run_with_tools(
+        self, messages: list, input_text: str, max_tool_iterations: int, **kwargs
+    ) -> str:
         """支持工具调用的运行逻辑"""
         current_iteration = 0
         final_response = ""
@@ -108,22 +122,27 @@ class MySimpleAgent(Agent):
                 clean_response = response
 
                 for call in tool_calls:
-                    result = self._execute_tool_call(call['tool_name'], call['parameters'])
+                    result = self._execute_tool_call(
+                        call["tool_name"], call["parameters"]
+                    )
                     print(f"🔧 the tool {call['tool_name']} output {result}")
                     tool_results.append(result)
                     # 从响应中移除工具调用标记
-                    clean_response = clean_response.replace(call['original'], "")
+                    clean_response = clean_response.replace(call["original"], "")
 
                 # 构建包含工具结果的消息
                 messages.append({"role": "assistant", "content": clean_response})
 
                 # 添加工具结果
                 tool_results_text = "\n\n".join(tool_results)
-                messages.append({"role": "user", "content": f"工具执行结果:\n{tool_results_text}\n\n请基于这些结果给出完整的回答。"})
-
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"工具执行结果:\n{tool_results_text}\n\n请基于这些结果给出完整的回答。",
+                    }
+                )
                 current_iteration += 1
                 continue
-
             # 没有工具调用，这是最终回答
             final_response = response
             break
@@ -139,18 +158,20 @@ class MySimpleAgent(Agent):
 
         return final_response
 
-    def _parse_tool_calls(self, text: str) -> list:
+    def _parse_tool_calls(self, text: str) -> List[Dict[str, Any]]:
         """解析文本中的工具调用"""
-        pattern = r'\[TOOL_CALL:([^:]+):([^\]]+)\]'
+        pattern = r"\[TOOL_CALL:([^:]+):([^\]]+)\]"
         matches = re.findall(pattern, text)
 
         tool_calls = []
         for tool_name, parameters in matches:
-            tool_calls.append({
-                'tool_name': tool_name.strip(),
-                'parameters': parameters.strip(),
-                'original': f'[TOOL_CALL:{tool_name}:{parameters}]'
-            })
+            tool_calls.append(
+                {
+                    "tool_name": tool_name.strip(),
+                    "parameters": parameters.strip(),
+                    "original": f"[TOOL_CALL:{tool_name}:{parameters}]",
+                }
+            )
 
         return tool_calls
 
@@ -160,51 +181,14 @@ class MySimpleAgent(Agent):
             return f"❌ 错误:未配置工具注册表"
 
         try:
-            # 智能参数解析
-            if 'search' in tool_name.lower():
-                # 计算器工具直接传入表达式
-                result = self.tool_registry.execute_tool(tool_name, parameters)
-            else:
-                # 其他工具使用智能参数解析
-                # param_dict = self._parse_tool_parameters(tool_name, parameters)
-                # tool = self.tool_registry.get_tool(tool_name)
-                # if not tool:
-                #     return f"❌ 错误:未找到工具 '{tool_name}'"
-                # result = tool.run(param_dict)
-                return f"❌ 错误:未找到工具 '{tool_name}'"
-
+            # 直接传入字符串参数，由 ToolRegistry 处理
+            result = self.tool_registry.execute_tool(tool_name, parameters)
             return f"🔧 工具 {tool_name} 执行结果:\n{result}"
 
+        except ValueError as e:
+            return f"❌ 错误:{str(e)}"
         except Exception as e:
             return f"❌ 工具调用失败:{str(e)}"
-
-    def _parse_tool_parameters(self, tool_name: str, parameters: str) -> dict:
-        """智能解析工具参数"""
-        param_dict = {}
-
-        if '=' in parameters:
-            # 格式: key=value 或 action=search,query=Python
-            if ',' in parameters:
-                # 多个参数:action=search,query=Python,limit=3
-                pairs = parameters.split(',')
-                for pair in pairs:
-                    if '=' in pair:
-                        key, value = pair.split('=', 1)
-                        param_dict[key.strip()] = value.strip()
-            else:
-                # 单个参数:key=value
-                key, value = parameters.split('=', 1)
-                param_dict[key.strip()] = value.strip()
-        else:
-            # 直接传入参数，根据工具类型智能推断
-            if tool_name == 'search':
-                param_dict = {'query': parameters}
-            elif tool_name == 'memory':
-                param_dict = {'action': 'search', 'query': parameters}
-            else:
-                param_dict = {'input': parameters}
-
-        return param_dict
 
     def stream_run(self, input_text: str, **kwargs) -> Iterator[str]:
         """
@@ -237,36 +221,8 @@ class MySimpleAgent(Agent):
         self.add_message(Message(full_response, "assistant"))
         print(f"✅ {self.name} 流式响应完成")
 
-    def add_tool(self, tool) -> None:
-        """添加工具到Agent（便利方法）"""
-        if not self.tool_registry:
-            from hello_agents import ToolRegistry
-            self.tool_registry = ToolRegistry()
-            self.enable_tool_calling = True
-
-        self.tool_registry.register_tool(tool)
-        print(f"🔧 工具 '{tool.name}' 已添加")
-
-    def has_tools(self) -> bool:
-        """检查是否有可用工具"""
-        return self.enable_tool_calling and self.tool_registry is not None
-    
-    def remove_tool(self, tool_name: str) -> bool:
-        """移除工具（便利方法）"""
-        if self.tool_registry:
-            self.tool_registry.unregister(tool_name)
-            return True
-        return False
-    
-    def list_tools(self) -> list:
-        """列出所有可用工具"""
-        if self.tool_registry:
-            return self.tool_registry.list_tools()
-        return []
-
-
 if __name__ == "__main__":
-    llmClient = HelloAgentsLLM(provider="ollama")
+    llmClient = HelloAgentsLLM()
     # 测试1:基础对话Agent（无工具）
     # print("=== 测试1:基础对话 ===")
     # basic_agent = MySimpleAgent(
@@ -274,27 +230,33 @@ if __name__ == "__main__":
     #     llm=llmClient,
     #     system_prompt="你是一个友好的AI助手，请用简洁明了的方式回答问题。",
     #     enable_tool_calling = False
-    # ) 
+    # )
     # response1 = basic_agent.run("你好，请介绍一下自己")
-    # print(f"基础对话响应: {response1}\n")    
+    # print(f"基础对话响应: {response1}\n")
 
-    # 测试2:带工具的Agent
-    print("=== 测试2:工具增强对话 ===")
-    tool_registory = ToolRegistry()
-    tool_search = WebSearch()
-    tool_registory.registerTool(tool_search)
+    # 测试2:带多个工具的Agent
+    print("=== 测试2:多工具增强对话 ===")
+    tool_registry = ToolRegistry()
+    tool_registry.registerTool(WebSearch())
+    tool_registry.registerTool(Memory())
+    tool_registry.registerTool(Weather())
+
+    print(f"已注册工具: {tool_registry.list_tools()}")
 
     enhanced_agent = MySimpleAgent(
         name="增强助手",
         llm=llmClient,
         system_prompt="你是一个智能助手，可以使用工具来帮助用户。",
-        tool_registry=tool_registory,
-        enable_tool_calling=True
+        tool_registry=tool_registry,
+        enable_tool_calling=True,
     )
-    response2 = enhanced_agent.run("nvidia最新的GPU性能")
-    print(f"工具增强响应: {response2}\n")    
+    response2 = enhanced_agent.run("北京天气如何")
+    print(f"工具增强响应: {response2}\n")
     # 测试3:流式响应
     # print("=== 测试3:流式响应 ===")
     # print("流式响应: ", end="")
     # for chunk in basic_agent.stream_run("请解释什么是人工智能"):
-    #     pass  # 内容已在stream_run中实时打印    
+    #     pass  # 内容已在stream_run中实时打印
+
+    # 查看对话历史
+    print(f"\n对话历史: {len(enhanced_agent.get_history())} 条消息")
